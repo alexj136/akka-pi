@@ -3,10 +3,21 @@ package interpreter
 import akka.actor._
 import syntax._
 
-class PiRunner(chanMap: Map[Name, Channel]) extends Actor {
+class PiRunner(var chanMap: Map[Name, Channel], var p: Pi) extends Actor {
+
+  def this(p: Pi) = this(Map.empty, p match {
+    case Par(q, r   ) => ???
+    case Rcv(c, b, p) => ???
+    case Srv(c, b, p) => ???
+    case Snd(c, m, p) => ???
+    case New(c, p   ) => ???
+    case End          => ???
+  })
 
   def receive: Receive = {
-    case Name(id) => println("lol")
+    case Name(id) => this.p match {
+      case _ => ???
+    }
   }
 }
 
