@@ -1,23 +1,11 @@
 package main
 
 import akka.actor._
-import syntax.Name
+import syntax._
 import interpreter._
 
-class Dummy(a: ActorRef) extends Actor {
-  def receive: Receive = {
-    case Name(0) => a ! ChanGet
-    case Name(1) => {
-      println("Balalau")
-      (context system) shutdown
-    }
-  }
-}
-
 object Main extends App {
-  val system: ActorSystem = ActorSystem("PiSystem")
-  val ch = system.actorOf(Props[Channel], name = "ch")
-  val dm = system.actorOf(Props(new Dummy(ch)), name = "dm")
-  dm ! new Name(0)
-  ch ! ChanPut(new Name(1))
+  val launcher: PiLauncher =
+    new PiLauncher(Par(Snd(Name(1), Name(2), End),Rcv(Name(1), Name(3), End)))
+  launcher go
 }

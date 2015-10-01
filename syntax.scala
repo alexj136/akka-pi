@@ -4,11 +4,11 @@ case class Name(val id: Int)
 
 sealed abstract class Pi {
   def free: Set[Name] = this match {
-    case Par(p, q   ) => (free p) union (free q)
-    case Rcv(c, b, p) => ((free p) - b) + c
-    case Srv(c, b, p) => ((free p) - b) + c
-    case Snd(c, m, p) => ((free p) + m) + c
-    case New(c, p   ) => (free p) - c
+    case Par(p, q   ) => (p free) union (p free)
+    case Rcv(c, b, p) => ((p free) - b) + c
+    case Srv(c, b, p) => ((p free) - b) + c
+    case Snd(c, m, p) => ((p free) + m) + c
+    case New(c, p   ) => (p free) - c
     case End          => Set empty
   }
 }
