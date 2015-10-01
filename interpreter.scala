@@ -3,48 +3,123 @@ package interpreter
 import akka.actor._
 import syntax._
 
-class PiRunner(var chanMap: Map[Name, Channel], var p: Pi) extends Actor {
+class PiLauncher(p: Pi) {
 
-  def this(p: Pi) = this(Map.empty, p match {
-    case Par(q, r   ) => ???
-    case Rcv(c, b, p) => ???
-    case Srv(c, b, p) => ???
-    case Snd(c, m, p) => ???
-    case New(c, p   ) => ???
-    case End          => ???
-  })
+  var running: Boolean = false
+
+  val system: ActorSystem = ActorSystem("PiLauncher")
+
+  def go: Unit = {
+    if (!this.running) {
+      this.running = true
+      system.actorOf(Props(classOf[PiRunner], free p, p)) ! PiGo
+    }
+    else throw new RuntimeException("Go'd a running PiLauncher")
+  }
+
+  def kill: Unit = {
+    system shutdown
+    this.running = false
+  }
+}
+
+// Signalling object sent to PiRunners to tell them to compute
+case object PiGo
+
+// Runs a Pi process
+class PiRunner(var chanMap: Map[Name, ActorRef], var proc: Pi) extends Actor {
+
+  def awaitDeliveryConfirmation: Receive = {
+    case ChanTaken => {
+      become receive
+      self ! PiGo
+    }
+  }
+  
+  var bindResponseTo: Option[Name] = None
+  def awaitResponse: Receive = {
+    case ChanGet(channel) => {
+      this.chanMap = this.chanMap.updated(this.bindResponseTo.get, channel)
+      this.bindResponseTo = None
+      become receive
+      self ! PiGo
+    }
+  }
 
   def receive: Receive = {
-    case Name(id) => this.p match {
-      case _ => ???
+    case PiGo => this.proc match {
+      case Par(p, q   ) => {
+        val newRunner: ActorRef =
+          context.actorOf(Props(classOf[PiRunner], this.chanMap, q))
+        newRunner ! PiGo
+        this.proc = p
+        self ! PiGo
+      }
+      case Rcv(c, b, p) => {
+        this.chanMap(c) ! ChanAsk
+        this.proc = p
+        this.bindResponseTo = Some(b)
+        become awaitResponse
+      }
+      case Srv(c, b, p) => {
+        this.chanMap(c) ! ChanAsk
+        this.proc = p
+        this.bindResponseTo = Some(b)
+        val newRunner: ActorRef =
+          context.actorOf(Props(classOf[PiRunner], this.chanMap, this.proc))
+        newRunner ! PiGo
+        become awaitResponse
+      }
+      case Snd(c, m, p) => {
+        this.chanMap(c) ! ChanGive(this.chanMap(m))
+        this.proc = p
+        become awaitDeliveryConfirmation
+      }
+      case New(c, p   ) => {
+        val channel: ActorRef = context.actorOf(Props[Channel])
+        this.chanMap = this.chanMap.updated(c, channel)
+        this.proc = p
+        self ! PiGo
+      }
+      case End          => context stop self
     }
   }
 }
 
+// Queries sent by PiRunners to Channels
 sealed abstract class ChanQuery
-case class  ChanPut(c: Name) extends ChanQuery
-case object ChanGet          extends ChanQuery
+// Precursor to a ChanTaken ChanQueryResponse
+case class  ChanGive(channel: ActorRef) extends ChanQuery
+// Precursor to a ChanGet ChanQueryResponse
+case object ChanAsk                     extends ChanQuery
 
+// Responses sent by Channels to PiRunners
+sealed abstract class ChanQueryResponse
+// Complements a ChanGive ChanQuery
+case class  ChanTaken                   extends ChanQueryResponse
+// Complements a ChanAsk ChanQuery
+case object ChanGet(channel: ActorRef)  extends ChanQueryResponse
+
+// Implements the behaviour of channels in pi calculus
 class Channel extends Actor {
   
-  var cur_msg: Option[Name] = None
+  var curMsgAndSender: Option[(ActorRef, ActorRef)] = None
+  def curMsg: Option[ActorRef] = curMsgAndSender map (_._1)
+  def curSender: Option[ActorRef] = curMsgAndSender map (_._2)
 
-  def receive: Receive = {
-    case ChanGet      if !cur_msg.isEmpty => {
-      sender ! this.cur_msg.get
-      this.cur_msg = None
-      println("ChanGet handled")
-    }
-    case ChanPut(msg) if  cur_msg.isEmpty => {
-      this.cur_msg = Some(msg)
-      println(s"ChanPut of ${msg.id} handled")
+  def holding: Receive = {
+    case ChanAsk => {
+      sender ! ChanGive(this.curMsg.get)
+      this.curSender.get ! ChanTaken
+      this.curMsgAndSender = None
+      become receive
     }
   }
-}
 
-class Dummy(a: ActorRef) extends Actor {
   def receive: Receive = {
-    case Name(0) => a ! ChanGet
-    case Name(1) => println("Balalau")
+    case ChanGive(msg, sender) => {
+      this.curMsgAndSender = Some((msg, sender))
+      become holding
+    }
   }
 }
