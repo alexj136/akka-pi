@@ -5,11 +5,12 @@ import syntax._
 
 class PiLauncher(p: Pi) {
 
-  def go: Unit = {
-    val system: ActorSystem = ActorSystem("PiLauncher")
+  val system: ActorSystem = {
+    val sys: ActorSystem = ActorSystem("PiLauncher")
     val initChanMap: Map[Name, ActorRef] =
-      (p.free map { case n => (n, system actorOf Props[Channel]) }).toMap
-    system.actorOf(Props(classOf[PiRunner], initChanMap, p)) ! PiGo
+      (p.free map { case n => (n, sys actorOf Props[Channel]) }).toMap
+    (sys actorOf Props(classOf[PiRunner], initChanMap, p)) ! PiGo
+    sys
   }
 }
 
