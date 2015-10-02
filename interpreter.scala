@@ -5,28 +5,48 @@ import syntax._
 
 class PiLauncher(p: Pi) {
 
-  val system: ActorSystem = {
+  val (system: ActorSystem, creationManager: ActorRef) = {
+
     val sys: ActorSystem = ActorSystem("PiLauncher")
     val initChanMap: Map[Name, ActorRef] =
       (p.free map { case n => (n, sys actorOf Props[Channel]) }).toMap
-    (sys actorOf Props(classOf[PiRunner], initChanMap, p)) ! PiGo
-    sys
+    val creationManager: ActorRef = sys actorOf Props[PiCreationManager]
+    creationManager ! MakeRunner(initChanMap, p)
+
+    (sys, creationManager)
   }
 }
+
+// Serves as parent actor for other actors
+class PiCreationManager extends Actor {
+
+  def receive: Receive = {
+    case MakeChannel => {
+      val channel: ActorRef = context.actorOf(Props[Channel])
+      sender ! MakeChannelResponse(channel)
+    }
+    case MakeRunner(chanMap, p) => {
+      context.actorOf(Props(classOf[PiRunner], chanMap, p, self)) ! PiGo
+    }
+  }
+}
+
+sealed abstract class CreationRequest
+case object MakeChannel extends CreationRequest
+case class  MakeRunner(chanMap: Map[Name, ActorRef], p: Pi)
+  extends CreationRequest
+
+case class MakeChannelResponse(channel: ActorRef)
 
 // Signalling object sent to PiRunners to tell them to compute
 case object PiGo
 
 // Runs a Pi process
-class PiRunner(var chanMap: Map[Name, ActorRef], var proc: Pi) extends Actor {
+class PiRunner(
+  var chanMap: Map[Name, ActorRef],
+  var proc: Pi,
+  val creationManager: ActorRef) extends Actor {
 
-  def awaitDeliveryConfirmation: Receive = {
-    case ChanTaken => {
-      context.unbecome()
-      self ! PiGo
-    }
-  }
-  
   var bindResponseTo: Option[Name] = None
   def awaitResponse: Receive = {
     case ChanGet(channel) => {
@@ -40,11 +60,9 @@ class PiRunner(var chanMap: Map[Name, ActorRef], var proc: Pi) extends Actor {
   def receive: Receive = {
     case PiGo => this.proc match {
       case Par(p, q   ) => {
-        val newRunner: ActorRef =
-          context.actorOf(Props(classOf[PiRunner], this.chanMap, q))
+        this.creationManager ! MakeRunner(this.chanMap, q)
         this.proc = p
         self ! PiGo
-        newRunner ! PiGo
       }
       case Rcv(c, b, p) => {
         this.chanMap(c) ! ChanAsk
@@ -56,21 +74,25 @@ class PiRunner(var chanMap: Map[Name, ActorRef], var proc: Pi) extends Actor {
         this.chanMap(c) ! ChanAsk
         this.proc = p
         this.bindResponseTo = Some(b)
-        val newRunner: ActorRef =
-          context.actorOf(Props(classOf[PiRunner], this.chanMap, this.proc))
-        newRunner ! PiGo
+        this.creationManager ! MakeRunner(this.chanMap, this.proc)
         context become awaitResponse
       }
       case Snd(c, m, p) => {
         this.chanMap(c) ! ChanGive(this.chanMap(m))
         this.proc = p
-        context become awaitDeliveryConfirmation
+        context.become({ case ChanTaken => {
+          context.unbecome()
+          self ! PiGo
+        }})
       }
       case New(c, p   ) => {
-        val channel: ActorRef = context.actorOf(Props[Channel])
-        this.chanMap = this.chanMap.updated(c, channel)
-        this.proc = p
-        self ! PiGo
+        this.creationManager ! MakeChannel
+        context.become({ case MakeChannelResponse(channel) => {
+          this.chanMap = this.chanMap.updated(c, channel)
+          this.proc = p
+          context.unbecome()
+          self ! PiGo
+        }})
       }
       case End          => {
         println("process ending")
