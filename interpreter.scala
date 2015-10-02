@@ -5,23 +5,11 @@ import syntax._
 
 class PiLauncher(p: Pi) {
 
-  var running: Boolean = false
-
-  val system: ActorSystem = ActorSystem("PiLauncher")
-
   def go: Unit = {
-    if (!this.running) {
-      this.running = true
-      val initChanMap: Map[Name, ActorRef] =
-        ((p free) map { case n => (n, system.actorOf(Props[Channel])) }).toMap
-      system.actorOf(Props(classOf[PiRunner], initChanMap, p)) ! PiGo
-    }
-    else throw new RuntimeException("Go'd a running PiLauncher")
-  }
-
-  def kill: Unit = {
-    system.shutdown()
-    this.running = false
+    val system: ActorSystem = ActorSystem("PiLauncher")
+    val initChanMap: Map[Name, ActorRef] =
+      (p.free map { case n => (n, system actorOf Props[Channel]) }).toMap
+    system.actorOf(Props(classOf[PiRunner], initChanMap, p)) ! PiGo
   }
 }
 
@@ -45,7 +33,6 @@ class PiRunner(var chanMap: Map[Name, ActorRef], var proc: Pi) extends Actor {
       this.bindResponseTo = None
       context.unbecome()
       self ! PiGo
-      println("received")
     }
   }
 
@@ -74,7 +61,6 @@ class PiRunner(var chanMap: Map[Name, ActorRef], var proc: Pi) extends Actor {
         context become awaitResponse
       }
       case Snd(c, m, p) => {
-        println("sending")
         this.chanMap(c) ! ChanGive(this.chanMap(m))
         this.proc = p
         context become awaitDeliveryConfirmation
@@ -87,7 +73,7 @@ class PiRunner(var chanMap: Map[Name, ActorRef], var proc: Pi) extends Actor {
       }
       case End          => {
         println("process ending")
-        context stop self
+        self ! PoisonPill
       }
     }
   }
@@ -116,7 +102,8 @@ class Channel extends Actor {
 
   def holding: Receive = {
     case ChanAsk => {
-      sender ! ChanGive(this.curMsg.get)
+      println("ChanAsk at channel")
+      sender ! ChanGet(this.curMsg.get)
       this.curSender.get ! ChanTaken
       this.curMsgAndSender = None
       context.unbecome()
@@ -125,6 +112,7 @@ class Channel extends Actor {
 
   def receive: Receive = {
     case ChanGive(msg) => {
+      println("ChanGive at channel")
       this.curMsgAndSender = Some((msg, sender))
       context become holding
     }
