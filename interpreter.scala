@@ -17,34 +17,35 @@ class PiLauncher(p: Pi) {
   }
 }
 
-// Serves as parent actor for other actors
+// Serves as parent actor for other actors. Keeps track of channels and runners.
+// Can be queried for deadlock detection.
 class PiCreationManager extends Actor {
+
+  var nextID: Int = 0
+  var channels: List[ActorRef] = Nil
+  var runners: Map[Int, ActorRef] = Map.empty
 
   def receive: Receive = {
     case MakeChannel => {
       val channel: ActorRef = context.actorOf(Props[Channel])
       sender ! MakeChannelResponse(channel)
+      this.channels = channel :: this.channels
     }
     case MakeRunner(chanMap, p) => {
-      context.actorOf(Props(classOf[PiRunner], chanMap, p, self)) ! PiGo
+      val runner: ActorRef =
+        context.actorOf(Props(classOf[PiRunner], chanMap, p, this.nextID, self))
+      runner ! PiGo
+      this.runners = this.runners.updated(this.nextID, runner)
+      this.nextID = this.nextID + 1
     }
   }
 }
-
-sealed abstract class CreationRequest
-case object MakeChannel extends CreationRequest
-case class  MakeRunner(chanMap: Map[Name, ActorRef], p: Pi)
-  extends CreationRequest
-
-case class MakeChannelResponse(channel: ActorRef)
-
-// Signalling object sent to PiRunners to tell them to compute
-case object PiGo
 
 // Runs a Pi process
 class PiRunner(
   var chanMap: Map[Name, ActorRef],
   var proc: Pi,
+  val id: Int,
   val creationManager: ActorRef) extends Actor {
 
   var bindResponseTo: Option[Name] = None
@@ -102,20 +103,6 @@ class PiRunner(
   }
 }
 
-// Queries sent by PiRunners to Channels
-sealed abstract class ChanQuery
-// Precursor to a ChanTaken ChanQueryResponse
-case class  ChanGive(channel: ActorRef) extends ChanQuery
-// Precursor to a ChanGet ChanQueryResponse
-case object ChanAsk                     extends ChanQuery
-
-// Responses sent by Channels to PiRunners
-sealed abstract class ChanQueryResponse
-// Complements a ChanGive ChanQuery
-case object ChanTaken                   extends ChanQueryResponse
-// Complements a ChanAsk ChanQuery
-case class  ChanGet(channel: ActorRef)  extends ChanQueryResponse
-
 // Implements the behaviour of channels in pi calculus
 class Channel extends Actor {
   
@@ -141,3 +128,33 @@ class Channel extends Actor {
     }
   }
 }
+
+// Top class for messages sent in this implementation
+sealed abstract class PiImplMessage
+
+// Queries sent by PiRunners to Channels
+sealed abstract class ChanQuery extends PiImplMessage
+// Precursor to a ChanTaken ChanQueryResponse
+case class  ChanGive(channel: ActorRef) extends ChanQuery
+// Precursor to a ChanGet ChanQueryResponse
+case object ChanAsk                     extends ChanQuery
+
+// Responses sent by Channels to PiRunners
+sealed abstract class ChanQueryResponse extends PiImplMessage
+// Complements a ChanGive ChanQuery
+case object ChanTaken                   extends ChanQueryResponse
+// Complements a ChanAsk ChanQuery
+case class  ChanGet(channel: ActorRef)  extends ChanQueryResponse
+
+// Used to tell the PiCreationManager to create a new process or channel
+sealed abstract class CreationRequest extends PiImplMessage
+// Requests a new channel
+case object MakeChannel extends CreationRequest
+// Requests a new process
+case class  MakeRunner(chanMap: Map[Name, ActorRef], p: Pi)
+  extends CreationRequest
+// Signals that a channel has been created to a process that requested a new one
+case class MakeChannelResponse(channel: ActorRef) extends PiImplMessage
+
+// Signalling object sent to PiRunners to tell them to do a computation step
+case object PiGo extends PiImplMessage
