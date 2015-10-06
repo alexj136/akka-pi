@@ -38,6 +38,48 @@ class PiCreationManager extends Actor {
       this.runners = this.runners.updated(this.nextID, runner)
       this.nextID = this.nextID + 1
     }
+    case CreationManagerCheck => {
+      sender ! CreationManagerStatus(channels, runners)
+    }
+    case Terminate => {
+      var procs: List[Pi] = Nil
+      for (val runner <- (this.runners.toList map _._2)) {
+        runner ! RunnerCheck
+        context.become({ case RunnerStatus(p) =>
+          procs = p :: procs
+          context.unbecome()
+        }})
+        runner ! PoisonPill
+      }
+      this.channels map _.!(PoisonPill)
+      sender ! Terminated
+      self ! PoisonPill
+    }
+  }
+}
+
+class PiTerminationWatcher(creationManager: ActorRef) extends Actor {
+
+  val pChannels: Option[List[ActorRef]] = None
+  val pRunners: Option[Map[Int, ActorRef]] = None
+
+  def receive: Receive = {
+    case CreationManagerCheck => {
+      creationManager ! CreationManagerCheck
+      context.become({ case CreationManagerStatus(channels, runners) => {
+        if (Some(channels) == this.pChannels && Some(runners) == this.pRunners) {
+          creationManager ! Terminate
+          context.become({ case Terminated => {
+            context.unbecome()
+          }})
+        }
+        else {
+          this.pChannels = Some(channels)
+          this.pRunners = Some(runners)
+        }
+        context.unbecome()
+      }})
+    }
   }
 }
 
@@ -48,54 +90,46 @@ class PiRunner(
   val id: Int,
   val creationManager: ActorRef) extends Actor {
 
-  var bindResponseTo: Option[Name] = None
-  def awaitResponse: Receive = {
-    case ChanGet(channel) => {
-      this.chanMap = this.chanMap.updated(this.bindResponseTo.get, channel)
-      this.bindResponseTo = None
-      context.unbecome()
-      self ! PiGo
-    }
-  }
-
   def receive: Receive = {
+    case RunnerCheck => {
+      sender ! RunnerStatus(this.proc)
+    }
     case PiGo => this.proc match {
-      case Par(p, q   ) => {
+      case Par(p, q      ) => {
         this.creationManager ! MakeRunner(this.chanMap, q)
         this.proc = p
         self ! PiGo
       }
-      case Rcv(c, b, p) => {
+      case Rcv(r, c, b, p) => {
         this.chanMap(c) ! ChanAsk
         this.proc = p
-        this.bindResponseTo = Some(b)
-        context become awaitResponse
+        if(r) {
+          this.creationManager ! MakeRunner(this.chanMap, this.proc)
+        }
+        context.become({ case ChanGet(channel) => {
+          this.chanMap = this.chanMap.updated(b, channel)
+          context.unbecome()
+        }})
+        self ! PiGo
       }
-      case Srv(c, b, p) => {
-        this.chanMap(c) ! ChanAsk
-        this.proc = p
-        this.bindResponseTo = Some(b)
-        this.creationManager ! MakeRunner(this.chanMap, this.proc)
-        context become awaitResponse
-      }
-      case Snd(c, m, p) => {
+      case Snd(c, m, p   ) => {
         this.chanMap(c) ! ChanGive(this.chanMap(m))
         this.proc = p
         context.become({ case ChanTaken => {
           context.unbecome()
-          self ! PiGo
         }})
+        self ! PiGo
       }
-      case New(c, p   ) => {
+      case New(c, p      ) => {
         this.creationManager ! MakeChannel
         context.become({ case MakeChannelResponse(channel) => {
           this.chanMap = this.chanMap.updated(c, channel)
-          this.proc = p
           context.unbecome()
-          self ! PiGo
         }})
+        this.proc = p
+        self ! PiGo
       }
-      case End          => {
+      case End             => {
         println("process ending")
         self ! PoisonPill
       }
@@ -158,3 +192,27 @@ case class MakeChannelResponse(channel: ActorRef) extends PiImplMessage
 
 // Signalling object sent to PiRunners to tell them to do a computation step
 case object PiGo extends PiImplMessage
+
+// Signals to the PiTerminationWatcher that it should check if termination has
+// occured
+case object CreationManagerCheck extends PiImplMessage
+
+// Sent by the PiCreationManager to the PiTerminationWatcher to indicate the
+// execution status
+case class CreationManagerStatus(
+  channels: List[ActorRef],
+  runners: Map[Int, ActorRef]) extends PiImplMessage
+
+// Sent by PiTerminationWatcher to PiCreationManager to instruct it to terminate
+case object Terminate extends PiImplMessage
+
+// Complement to the previous message
+case object Terminated extends PiImplMessage
+
+// Sent by the PiCreationManager to query the execution status of the process
+// contained in a PiRunner
+case object RunnerCheck extends PiImplMessage
+
+// Sent by a PiRunner to inform the PiCreationManager of the status of the
+// contained process
+case object RunnerStatus(p: Pi) extends PiImplMessage
