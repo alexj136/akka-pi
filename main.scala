@@ -5,5 +5,10 @@ import syntax._
 import interpreter._
 
 object Main extends App {
-  new PiLauncher(Par(Snd(Name(1), Name(2), End),Rcv(false, Name(1), Name(3), End)))
+  val piLauncher: PiLauncher =
+    new PiLauncher(Par(
+      New(Name(4),Snd(Name(1), Name(2), End)),
+      Rcv(false, Name(1), Name(3), End)))
+  Thread.sleep(5000)
+  piLauncher.terminate
 }

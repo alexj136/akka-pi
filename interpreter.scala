@@ -8,77 +8,60 @@ class PiLauncher(p: Pi) {
   val (system: ActorSystem, creationManager: ActorRef) = {
 
     val sys: ActorSystem = ActorSystem("PiLauncher")
-    val initChanMap: Map[Name, ActorRef] =
-      (p.free map { case n => (n, sys actorOf Props[Channel]) }).toMap
     val creationManager: ActorRef = sys actorOf Props[PiCreationManager]
+    val initChanMap: Map[Name, ActorRef] = (p.free map { case n =>
+      (n, sys actorOf Props(classOf[Channel], creationManager)) }).toMap
     creationManager ! MakeRunner(initChanMap, p)
 
     (sys, creationManager)
   }
+
+  def terminate: Unit = {
+    this.creationManager ! TerminateAll
+    this.system.shutdown()
+  }
+
+  def isTerminated: Boolean = this.system.isTerminated
 }
 
 // Serves as parent actor for other actors. Keeps track of channels and runners.
 // Can be queried for deadlock detection.
 class PiCreationManager extends Actor {
 
-  var nextID: Int = 0
-  var channels: List[ActorRef] = Nil
-  var runners: Map[Int, ActorRef] = Map.empty
+  var liveActors: Set[ActorRef] = Set.empty
+  var result: List[Pi] = Nil
 
   def receive: Receive = {
     case MakeChannel => {
-      val channel: ActorRef = context.actorOf(Props[Channel])
-      sender ! MakeChannelResponse(channel)
-      this.channels = channel :: this.channels
+      val newChannel: ActorRef = context.actorOf(Props(classOf[Channel], self))
+      sender ! MakeChannelResponse(newChannel)
+      this.liveActors = this.liveActors + newChannel
     }
     case MakeRunner(chanMap, p) => {
-      val runner: ActorRef =
-        context.actorOf(Props(classOf[PiRunner], chanMap, p, this.nextID, self))
-      runner ! PiGo
-      this.runners = this.runners.updated(this.nextID, runner)
-      this.nextID = this.nextID + 1
+      val newRunner: ActorRef =
+        context.actorOf(Props(classOf[PiRunner], chanMap, p, self))
+      newRunner ! PiGo
+      this.liveActors = this.liveActors + newRunner
     }
-    case CreationManagerCheck => {
-      sender ! CreationManagerStatus(channels, runners)
+    case ReportStop(p) => {
+      this.result = this.result ++ p.toList
+      this.liveActors = this.liveActors - sender
+      sender ! PoisonPill
     }
-    case Terminate => {
-      var procs: List[Pi] = Nil
-      for (val runner <- (this.runners.toList map _._2)) {
-        runner ! RunnerCheck
-        context.become({ case RunnerStatus(p) =>
-          procs = p :: procs
-          context.unbecome()
-        }})
-        runner ! PoisonPill
-      }
-      this.channels map _.!(PoisonPill)
-      sender ! Terminated
+    case TerminateAll => {
+      this.liveActors map { case p => p ! ForceReportStop }
       self ! PoisonPill
     }
   }
 }
 
-class PiTerminationWatcher(creationManager: ActorRef) extends Actor {
+abstract class PiActor(val creationManager: ActorRef) extends Actor {
 
-  val pChannels: Option[List[ActorRef]] = None
-  val pRunners: Option[Map[Int, ActorRef]] = None
+  def reportValue: Option[Pi] = None
 
-  def receive: Receive = {
-    case CreationManagerCheck => {
-      creationManager ! CreationManagerCheck
-      context.become({ case CreationManagerStatus(channels, runners) => {
-        if (Some(channels) == this.pChannels && Some(runners) == this.pRunners) {
-          creationManager ! Terminate
-          context.become({ case Terminated => {
-            context.unbecome()
-          }})
-        }
-        else {
-          this.pChannels = Some(channels)
-          this.pRunners = Some(runners)
-        }
-        context.unbecome()
-      }})
+  def forceReportStop: Receive = {
+    case ForceReportStop => {
+      this.creationManager ! ReportStop(this.reportValue)
     }
   }
 }
@@ -87,13 +70,11 @@ class PiTerminationWatcher(creationManager: ActorRef) extends Actor {
 class PiRunner(
   var chanMap: Map[Name, ActorRef],
   var proc: Pi,
-  val id: Int,
-  val creationManager: ActorRef) extends Actor {
+  creationManager: ActorRef) extends PiActor(creationManager) {
 
-  def receive: Receive = {
-    case RunnerCheck => {
-      sender ! RunnerStatus(this.proc)
-    }
+  override def reportValue: Option[Pi] = Some(this.proc)
+
+  def receive = ({
     case PiGo => this.proc match {
       case Par(p, q      ) => {
         this.creationManager ! MakeRunner(this.chanMap, q)
@@ -101,66 +82,68 @@ class PiRunner(
         self ! PiGo
       }
       case Rcv(r, c, b, p) => {
-        this.chanMap(c) ! ChanAsk
-        this.proc = p
+        println("receiver asking channel for message")
+        this.chanMap(c) ! MsgRequestFromReceiver
         if(r) {
           this.creationManager ! MakeRunner(this.chanMap, this.proc)
         }
-        context.become({ case ChanGet(channel) => {
+        this.proc = p
+        context.become(({ case MsgChanToReceiver(channel) => {
+          println("receiver got message from channel")
           this.chanMap = this.chanMap.updated(b, channel)
           context.unbecome()
-        }})
-        self ! PiGo
+          self ! PiGo
+        }}: Receive) orElse forceReportStop)
       }
       case Snd(c, m, p   ) => {
-        this.chanMap(c) ! ChanGive(this.chanMap(m))
+        println("sender handing message to channel")
+        this.chanMap(c) ! MsgSenderToChan(this.chanMap(m))
         this.proc = p
-        context.become({ case ChanTaken => {
+        context.become(({ case MsgConfirmToSender => {
+          println("sender received delivery confirmation from channel")
           context.unbecome()
-        }})
-        self ! PiGo
+          self ! PiGo
+        }}: Receive) orElse forceReportStop)
       }
       case New(c, p      ) => {
         this.creationManager ! MakeChannel
-        context.become({ case MakeChannelResponse(channel) => {
+        context.become(({ case MakeChannelResponse(channel) => {
           this.chanMap = this.chanMap.updated(c, channel)
+          this.proc = p
           context.unbecome()
-        }})
-        this.proc = p
-        self ! PiGo
+          self ! PiGo
+        }}: Receive) orElse forceReportStop)
       }
-      case End             => {
-        println("process ending")
-        self ! PoisonPill
-      }
+      case End             => this.creationManager ! ReportStop(None)
     }
-  }
+  }: Receive) orElse forceReportStop
 }
 
 // Implements the behaviour of channels in pi calculus
-class Channel extends Actor {
-  
-  var curMsgAndSender: Option[(ActorRef, ActorRef)] = None
-  def curMsg: Option[ActorRef] = curMsgAndSender map (_._1)
-  def curSender: Option[ActorRef] = curMsgAndSender map (_._2)
+class Channel(creationManager: ActorRef) extends PiActor(creationManager) {
 
-  def holding: Receive = {
-    case ChanAsk => {
-      println("ChanAsk at channel")
-      sender ! ChanGet(this.curMsg.get)
-      this.curSender.get ! ChanTaken
-      this.curMsgAndSender = None
-      context.unbecome()
+  def receive = ({
+    // If the receiver request comes before the sender delivery
+    case MsgRequestFromReceiver => {
+      val msgReceiver: ActorRef = sender
+      context.become(({ case MsgSenderToChan(msg) => {
+        val msgSender: ActorRef = sender
+        msgReceiver ! MsgChanToReceiver(msg)
+        msgSender ! MsgConfirmToSender
+        context.unbecome()
+      }}: Receive) orElse forceReportStop)
     }
-  }
-
-  def receive: Receive = {
-    case ChanGive(msg) => {
-      println("ChanGive at channel")
-      this.curMsgAndSender = Some((msg, sender))
-      context become holding
+    // If the sender delivery comes before the receiver request
+    case MsgSenderToChan(msg) => {
+      val msgSender: ActorRef = sender
+      context.become(({ case MsgRequestFromReceiver => {
+        val msgReceiver: ActorRef = sender
+        msgReceiver ! MsgChanToReceiver(msg)
+        msgSender ! MsgConfirmToSender
+        context.unbecome()
+      }}: Receive) orElse forceReportStop)
     }
-  }
+  }: Receive) orElse forceReportStop
 }
 
 // Top class for messages sent in this implementation
@@ -168,17 +151,17 @@ sealed abstract class PiImplMessage
 
 // Queries sent by PiRunners to Channels
 sealed abstract class ChanQuery extends PiImplMessage
-// Precursor to a ChanTaken ChanQueryResponse
-case class  ChanGive(channel: ActorRef) extends ChanQuery
-// Precursor to a ChanGet ChanQueryResponse
-case object ChanAsk                     extends ChanQuery
+// Precursor to a MsgConfirmToSender ChanQueryResponse
+case class  MsgSenderToChan(channel: ActorRef) extends ChanQuery
+// Precursor to a MsgChanToReceiver ChanQueryResponse
+case object MsgRequestFromReceiver             extends ChanQuery
 
 // Responses sent by Channels to PiRunners
 sealed abstract class ChanQueryResponse extends PiImplMessage
-// Complements a ChanGive ChanQuery
-case object ChanTaken                   extends ChanQueryResponse
-// Complements a ChanAsk ChanQuery
-case class  ChanGet(channel: ActorRef)  extends ChanQueryResponse
+// Complements a MsgSenderToChan ChanQuery
+case object MsgConfirmToSender                   extends ChanQueryResponse
+// Complements a MsgRequestFromReceiver ChanQuery
+case class  MsgChanToReceiver(channel: ActorRef) extends ChanQueryResponse
 
 // Used to tell the PiCreationManager to create a new process or channel
 sealed abstract class CreationRequest extends PiImplMessage
@@ -193,26 +176,13 @@ case class MakeChannelResponse(channel: ActorRef) extends PiImplMessage
 // Signalling object sent to PiRunners to tell them to do a computation step
 case object PiGo extends PiImplMessage
 
-// Signals to the PiTerminationWatcher that it should check if termination has
-// occured
-case object CreationManagerCheck extends PiImplMessage
+// Tells PiActors to report their status to their creationManager which will
+// then stop them
+case object ForceReportStop extends PiImplMessage
 
-// Sent by the PiCreationManager to the PiTerminationWatcher to indicate the
-// execution status
-case class CreationManagerStatus(
-  channels: List[ActorRef],
-  runners: Map[Int, ActorRef]) extends PiImplMessage
+// Used by PiActors to tell their creationManager their status before being
+// stopped
+case class ReportStop(op: Option[Pi]) extends PiImplMessage
 
-// Sent by PiTerminationWatcher to PiCreationManager to instruct it to terminate
-case object Terminate extends PiImplMessage
-
-// Complement to the previous message
-case object Terminated extends PiImplMessage
-
-// Sent by the PiCreationManager to query the execution status of the process
-// contained in a PiRunner
-case object RunnerCheck extends PiImplMessage
-
-// Sent by a PiRunner to inform the PiCreationManager of the status of the
-// contained process
-case object RunnerStatus(p: Pi) extends PiImplMessage
+// Indicates to the creationManager that it must stop the world
+case object TerminateAll extends PiImplMessage
