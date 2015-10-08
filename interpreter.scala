@@ -1,6 +1,10 @@
 package interpreter
 
+import scala.concurrent.{Await, Future}
+import scala.concurrent.duration._
+import akka.util.Timeout
 import akka.actor._
+import akka.pattern.Patterns
 import syntax._
 
 class PiLauncher(p: Pi) {
@@ -8,9 +12,12 @@ class PiLauncher(p: Pi) {
   val (system: ActorSystem, creationManager: ActorRef) = {
 
     val sys: ActorSystem = ActorSystem("PiLauncher")
-    val creationManager: ActorRef = sys actorOf Props[PiCreationManager]
+    val creationManager: ActorRef =
+      sys.actorOf(Props[PiCreationManager], "PiCreationManager")
     val initChanMap: Map[Name, ActorRef] = (p.free map { case n =>
-      (n, sys actorOf Props(classOf[Channel], creationManager)) }).toMap
+      (n, sys.actorOf(Props(classOf[PiChannel], creationManager),
+        s"PiChannelI${n.id}")) }).toMap
+    creationManager ! SetLiveActors(initChanMap.values.toSet)
     creationManager ! MakeRunner(initChanMap, p)
 
     (sys, creationManager)
@@ -18,7 +25,7 @@ class PiLauncher(p: Pi) {
 
   def terminate: Unit = {
     this.creationManager ! TerminateAll
-    this.system.shutdown()
+    //this.system.shutdown()
   }
 
   def isTerminated: Boolean = this.system.isTerminated
@@ -31,28 +38,45 @@ class PiCreationManager extends Actor {
   var liveActors: Set[ActorRef] = Set.empty
   var result: List[Pi] = Nil
 
-  def receive: Receive = {
+  def receive: Receive = setLiveActors
+
+  def setLiveActors: Receive = {
+    case SetLiveActors(set) => {
+      this.liveActors = set
+      context.become(mainReceive)
+    }
+  }
+
+  def mainReceive: Receive = {
     case MakeChannel => {
-      val newChannel: ActorRef = context.actorOf(Props(classOf[Channel], self))
+      val newChannel: ActorRef = context.actorOf(Props(classOf[PiChannel],
+        self), s"PiChannel${this.liveActors.size}")
       sender ! MakeChannelResponse(newChannel)
       this.liveActors = this.liveActors + newChannel
     }
     case MakeRunner(chanMap, p) => {
-      val newRunner: ActorRef =
-        context.actorOf(Props(classOf[PiRunner], chanMap, p, self))
+      val newRunner: ActorRef = context.actorOf(Props(classOf[PiRunner],
+        chanMap, p, self), s"PiRunner${this.liveActors.size}")
       newRunner ! PiGo
       this.liveActors = this.liveActors + newRunner
     }
     case ReportStop(p) => {
       this.result = this.result ++ p.toList
       this.liveActors = this.liveActors - sender
-      sender ! PoisonPill
+      val done: Future[java.lang.Boolean] =
+        Patterns.gracefulStop(sender, 10.seconds)
+      Await.result(done, 10.seconds)
+      if (this.liveActors.isEmpty) {
+        context.system.shutdown
+      }
     }
     case TerminateAll => {
       this.liveActors map { case p => p ! ForceReportStop }
-      self ! PoisonPill
     }
   }
+}
+
+class PiTerminationWatcher(timeout: Int) extends Actor {
 }
 
 abstract class PiActor(val creationManager: ActorRef) extends Actor {
@@ -120,7 +144,7 @@ class PiRunner(
 }
 
 // Implements the behaviour of channels in pi calculus
-class Channel(creationManager: ActorRef) extends PiActor(creationManager) {
+class PiChannel(creationManager: ActorRef) extends PiActor(creationManager) {
 
   def receive = ({
     // If the receiver request comes before the sender delivery
@@ -149,14 +173,14 @@ class Channel(creationManager: ActorRef) extends PiActor(creationManager) {
 // Top class for messages sent in this implementation
 sealed abstract class PiImplMessage
 
-// Queries sent by PiRunners to Channels
+// Queries sent by PiRunners to PiChannels
 sealed abstract class ChanQuery extends PiImplMessage
 // Precursor to a MsgConfirmToSender ChanQueryResponse
 case class  MsgSenderToChan(channel: ActorRef) extends ChanQuery
 // Precursor to a MsgChanToReceiver ChanQueryResponse
 case object MsgRequestFromReceiver             extends ChanQuery
 
-// Responses sent by Channels to PiRunners
+// Responses sent by PiChannels to PiRunners
 sealed abstract class ChanQueryResponse extends PiImplMessage
 // Complements a MsgSenderToChan ChanQuery
 case object MsgConfirmToSender                   extends ChanQueryResponse
@@ -186,3 +210,7 @@ case class ReportStop(op: Option[Pi]) extends PiImplMessage
 
 // Indicates to the creationManager that it must stop the world
 case object TerminateAll extends PiImplMessage
+
+// Used by the PiLauncher to give the references to the initial channels to the
+// creationManager
+case class SetLiveActors(actorset: Set[ActorRef]) extends PiImplMessage
