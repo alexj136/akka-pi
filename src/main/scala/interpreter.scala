@@ -19,13 +19,10 @@ class PiLauncher(p: Pi) {
         s"PiChannelI${n.id}")) }).toMap
     creationManager ! SetLiveActors(initChanMap.values.toSet)
     creationManager ! MakeRunner(initChanMap, p)
+    sys.scheduler.schedule(3.seconds, 3.seconds, creationManager,
+      CheckFinished)(sys.dispatcher)
 
     (sys, creationManager)
-  }
-
-  def terminate: Unit = {
-    this.creationManager ! TerminateAll
-    //this.system.shutdown()
   }
 
   def isTerminated: Boolean = this.system.isTerminated
@@ -38,6 +35,8 @@ class PiCreationManager extends Actor {
   var liveActors: Set[ActorRef] = Set.empty
   var result: List[Pi] = Nil
 
+  var sendSinceTimerReset: Boolean = false
+
   def receive: Receive = setLiveActors
 
   def setLiveActors: Receive = {
@@ -48,6 +47,21 @@ class PiCreationManager extends Actor {
   }
 
   def mainReceive: Receive = {
+    case SendOccurred => sendSinceTimerReset = true
+    case CheckFinished => {
+      if (sendSinceTimerReset) sendSinceTimerReset = false
+      else this.liveActors map { case p => p ! ForceReportStop }
+    }
+    case ReportStop(p) => {
+      this.result = this.result ++ p.toList
+      this.liveActors = this.liveActors - sender
+      val done: Future[java.lang.Boolean] =
+        Patterns.gracefulStop(sender, 10.seconds)
+      Await.result(done, 10.seconds)
+      if (this.liveActors.isEmpty) {
+        context.system.shutdown
+      }
+    }
     case MakeChannel => {
       val newChannel: ActorRef = context.actorOf(Props(classOf[PiChannel],
         self), s"PiChannel${this.liveActors.size}")
@@ -60,23 +74,7 @@ class PiCreationManager extends Actor {
       newRunner ! PiGo
       this.liveActors = this.liveActors + newRunner
     }
-    case ReportStop(p) => {
-      this.result = this.result ++ p.toList
-      this.liveActors = this.liveActors - sender
-      val done: Future[java.lang.Boolean] =
-        Patterns.gracefulStop(sender, 10.seconds)
-      Await.result(done, 10.seconds)
-      if (this.liveActors.isEmpty) {
-        context.system.shutdown
-      }
-    }
-    case TerminateAll => {
-      this.liveActors map { case p => p ! ForceReportStop }
-    }
   }
-}
-
-class PiTerminationWatcher(timeout: Int) extends Actor {
 }
 
 abstract class PiActor(val creationManager: ActorRef) extends Actor {
@@ -146,14 +144,19 @@ class PiRunner(
 // Implements the behaviour of channels in pi calculus
 class PiChannel(creationManager: ActorRef) extends PiActor(creationManager) {
 
+  def deliver(sndr: ActorRef, rcvr: ActorRef, msg: ActorRef): Unit = {
+        creationManager ! SendOccurred
+        rcvr ! MsgChanToReceiver(msg)
+        sndr ! MsgConfirmToSender
+  }
+
   def receive = ({
     // If the receiver request comes before the sender delivery
     case MsgRequestFromReceiver => {
       val msgReceiver: ActorRef = sender
       context.become(({ case MsgSenderToChan(msg) => {
         val msgSender: ActorRef = sender
-        msgReceiver ! MsgChanToReceiver(msg)
-        msgSender ! MsgConfirmToSender
+        this.deliver(msgSender, msgReceiver, msg)
         context.unbecome()
       }}: Receive) orElse forceReportStop)
     }
@@ -162,8 +165,7 @@ class PiChannel(creationManager: ActorRef) extends PiActor(creationManager) {
       val msgSender: ActorRef = sender
       context.become(({ case MsgRequestFromReceiver => {
         val msgReceiver: ActorRef = sender
-        msgReceiver ! MsgChanToReceiver(msg)
-        msgSender ! MsgConfirmToSender
+        this.deliver(msgSender, msgReceiver, msg)
         context.unbecome()
       }}: Receive) orElse forceReportStop)
     }
@@ -208,9 +210,12 @@ case object ForceReportStop extends PiImplMessage
 // stopped
 case class ReportStop(op: Option[Pi]) extends PiImplMessage
 
-// Indicates to the creationManager that it must stop the world
-case object TerminateAll extends PiImplMessage
-
 // Used by the PiLauncher to give the references to the initial channels to the
 // creationManager
 case class SetLiveActors(actorset: Set[ActorRef]) extends PiImplMessage
+
+// Tells the creationManager to test if the system has finished
+case object CheckFinished extends PiImplMessage
+
+// Tells the creationManager that a send has occurred since the last tick
+case object SendOccurred extends PiImplMessage
