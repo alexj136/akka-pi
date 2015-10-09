@@ -2,9 +2,8 @@ package interpreter
 
 import scala.concurrent.{Await, Future}
 import scala.concurrent.duration._
-import akka.util.Timeout
 import akka.actor._
-import akka.pattern.Patterns
+import akka.pattern.{Patterns, ask}
 import syntax._
 
 class PiLauncher(p: Pi) {
@@ -24,8 +23,6 @@ class PiLauncher(p: Pi) {
 
     (sys, creationManager)
   }
-
-  def isTerminated: Boolean = this.system.isTerminated
 }
 
 // Serves as parent actor for other actors. Keeps track of channels and runners.
@@ -55,9 +52,7 @@ class PiCreationManager extends Actor {
     case ReportStop(p) => {
       this.result = this.result ++ p.toList
       this.liveActors = this.liveActors - sender
-      val done: Future[java.lang.Boolean] =
-        Patterns.gracefulStop(sender, 10.seconds)
-      Await.result(done, 10.seconds)
+      Await.result(Patterns.gracefulStop(sender, 10.seconds), Duration.Inf)
       if (this.liveActors.isEmpty) {
         context.system.shutdown
       }
