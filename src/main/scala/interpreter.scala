@@ -2,17 +2,21 @@ package interpreter
 
 import scala.concurrent.{Await, Future}
 import scala.concurrent.duration._
+import akka.util.Timeout
 import akka.actor._
 import akka.pattern.{Patterns, ask}
 import syntax._
 
-class PiLauncher(p: Pi) {
+class PiLauncher(p: Pi, onCompletion: Function1[Pi, Unit]) {
 
   val (system: ActorSystem, creationManager: ActorRef) = {
 
     val sys: ActorSystem = ActorSystem("PiLauncher")
+    sys.registerOnTermination(new Runnable {
+      def run: Unit = onCompletion(result.get)
+    })
     val creationManager: ActorRef =
-      sys.actorOf(Props[PiCreationManager], "PiCreationManager")
+      sys.actorOf(Props(classOf[PiCreationManager], this), "PiCreationManager")
     val initChanMap: Map[Name, ActorRef] = (p.free map { case n =>
       (n, sys.actorOf(Props(classOf[PiChannel], creationManager),
         s"PiChannelI${n.id}")) }).toMap
@@ -23,16 +27,18 @@ class PiLauncher(p: Pi) {
 
     (sys, creationManager)
   }
+
+  var result: Option[Pi] = None
 }
 
 // Serves as parent actor for other actors. Keeps track of channels and runners.
 // Can be queried for deadlock detection.
-class PiCreationManager extends Actor {
+class PiCreationManager(launcher: PiLauncher) extends Actor {
 
   var liveActors: Set[ActorRef] = Set.empty
   var result: List[Pi] = Nil
-
   var sendSinceTimerReset: Boolean = false
+  var reportTo: Option[ActorRef] = None
 
   def receive: Receive = setLiveActors
 
@@ -40,6 +46,7 @@ class PiCreationManager extends Actor {
     case SetLiveActors(set) => {
       this.liveActors = set
       context.become(mainReceive)
+      this.reportTo = Some(sender)
     }
   }
 
@@ -54,6 +61,7 @@ class PiCreationManager extends Actor {
       this.liveActors = this.liveActors - sender
       Await.result(Patterns.gracefulStop(sender, 10.seconds), Duration.Inf)
       if (this.liveActors.isEmpty) {
+        launcher.result = Some(Pi fromList this.result)
         context.system.shutdown
       }
     }
@@ -99,25 +107,21 @@ class PiRunner(
         self ! PiGo
       }
       case Rcv(r, c, b, p) => {
-        println("receiver asking channel for message")
         this.chanMap(c) ! MsgRequestFromReceiver
         if(r) {
           this.creationManager ! MakeRunner(this.chanMap, this.proc)
         }
         this.proc = p
         context.become(({ case MsgChanToReceiver(channel) => {
-          println("receiver got message from channel")
           this.chanMap = this.chanMap.updated(b, channel)
           context.unbecome()
           self ! PiGo
         }}: Receive) orElse forceReportStop)
       }
       case Snd(c, m, p   ) => {
-        println("sender handing message to channel")
         this.chanMap(c) ! MsgSenderToChan(this.chanMap(m))
         this.proc = p
         context.become(({ case MsgConfirmToSender => {
-          println("sender received delivery confirmation from channel")
           context.unbecome()
           self ! PiGo
         }}: Receive) orElse forceReportStop)

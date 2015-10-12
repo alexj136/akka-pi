@@ -14,5 +14,5 @@ object Main extends App {
         End)))),
       Rcv(false, Name(1), Name(3),
         Rcv(false, Name(1), Name(2),
-        End))))
+        End))), { case pi => println(pi) })
 }

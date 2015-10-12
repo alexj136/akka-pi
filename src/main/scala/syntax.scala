@@ -23,3 +23,12 @@ case class  Rcv(r: Boolean , c: Name , b: Name , p: Pi ) extends Pi
 case class  Snd(c: Name    , m: Name , p: Pi           ) extends Pi
 case class  New(c: Name    , p: Pi                     ) extends Pi
 case object End                                          extends Pi
+
+object Pi {
+  def fromList(ps: List[Pi]): Pi = ps match {
+    case           Nil => End
+    case      q :: Nil => q
+    case p :: q :: Nil => Par(p, q)
+    case p :: q :: qs  => Par(p, Pi fromList qs)
+  }
+}
